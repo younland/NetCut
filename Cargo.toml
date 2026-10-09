@@ -1,0 +1,40 @@
+[package]
+name = "netcut"
+version = "0.1.0"
+edition = "2024"
+description = "一键断网：基于 GPUI 的 Windows 网络开关工具"
+build = "build.rs"
+
+[build-dependencies]
+embed-resource = "3"
+
+[dependencies]
+gpui-kit = "0.7.1"
+tray-icon = "0.26"
+futures = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["png"] }
+muda = { version = "0.21", default-features = false }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Devices_DeviceAndDriverInstallation",
+    "Win32_System_Registry",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+] }
+
+[profile.dev.package]
+gpui-pre = { opt-level = 3 }
+gpui-component = { opt-level = 3 }
+gpui-kit = { opt-level = 3 }
+gpui-kit-assets = { opt-level = 3 }
+gpui-pre-macros = { opt-level = 3 }
+gpui-pre-platform = { opt-level = 3 }
+rustybuzz = { opt-level = 3 }
+taffy = { opt-level = 3 }
+ttf-parser = { opt-level = 3 }
