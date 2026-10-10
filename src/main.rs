@@ -1,11 +1,17 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+mod dnsproxy;
+mod wfp;
+mod whitelist;
+
 use futures::{StreamExt, channel::mpsc::UnboundedSender};
+use std::net::ToSocketAddrs;
 use gpui_kit::base::StyledExt as _;
 use gpui_kit::component::{
     ActiveTheme, Disableable, Icon, IconName, Sizable,
     button::{Button, ButtonVariants},
     combobox::{Combobox, ComboboxState},
+    input::{Textarea, TextareaState},
     searchable_list::{SearchableGroup, SearchableListItem, SearchableVec},
     theme::{Theme, ThemeMode},
 };
@@ -43,6 +49,8 @@ struct AdapterInfo {
     gateway: String,
     /// DNS 服务器（多个用逗号分隔）
     dns: String,
+    /// 接口 LUID（WFP 过滤用）
+    luid: u64,
 }
 
 enum Msg {
@@ -61,10 +69,11 @@ enum Msg {
     /// 定时刷新：后台重新读取网卡与地址信息
     Refresh,
     RefreshResult(Result<(NetStatus, Vec<AdapterInfo>), String>),
+    /// DNS 命中的白名单解析结果（域名 → IP）
+    WhitelistResolved(Vec<std::net::IpAddr>, u32, Option<std::sync::mpsc::Sender<()>>),
     ShowWindow,
     Quit,
     NetResult(Result<(NetStatus, Vec<AdapterInfo>), String>),
-    LanResult(Result<(NetStatus, Vec<AdapterInfo>), String>, bool),
 }
 
 struct NetCut {
@@ -77,6 +86,17 @@ struct NetCut {
     busy: bool,
     /// 当前处于局域网模式的网卡 GUID
     lan_adapters: std::collections::HashSet<String>,
+    /// 局域网模式的 WFP 过滤会话（持有即已启用，丢弃即撤销全部规则）
+    lan_filter: Option<wfp::LanFilterSession>,
+    /// 域名白名单命中后启动的 DNS 转发器
+    dns_proxy: Option<dnsproxy::DnsProxy>,
+    /// 当前使用的上游 DNS（重建转发器时复用）
+    dns_upstream: Vec<std::net::IpAddr>,
+    /// 白名单放行规则：IP → (规则 id, 过期时间)
+    whitelist_permits: std::collections::HashMap<
+        std::net::IpAddr,
+        (u64, std::time::Instant),
+    >,
     /// 下拉框中选中的网卡 GUID
     selected: Option<String>,
     adapters: Vec<AdapterInfo>,
@@ -290,6 +310,7 @@ fn query_status() -> Result<(NetStatus, Vec<AdapterInfo>), String> {
             mask,
             gateway,
             dns,
+            luid: runtime.map(|a| a.luid).unwrap_or(0),
         });
     }
     unsafe { setup::SetupDiDestroyDeviceInfoList(hdi) };
@@ -497,46 +518,6 @@ fn spawn_adapter_thread(tx: UnboundedSender<Msg>, devinst: u32, enable: bool) {
 type NetResult = Result<(NetStatus, Vec<AdapterInfo>), String>;
 
 // ---------------------------------------------------------------------------
-// 局域网模式（按网卡清空默认网关，禁止外网；退出时补回网关）
-// ---------------------------------------------------------------------------
-
-#[derive(serde::Serialize, serde::Deserialize, Clone, Default)]
-struct AdapterBackup {
-    devinst: u32,
-    /// 接口索引（恢复路由时使用；DHCP 网卡的网关只在运行时路由表里）
-    #[serde(default)]
-    if_index: u32,
-    guid: String,
-    name: String,
-    enable_dhcp: bool,
-    ip: Vec<String>,
-    mask: Vec<String>,
-    gateway: Vec<String>,
-    /// DHCP 下发的网关（用于退出局域网模式时恢复路由）
-    #[serde(default)]
-    dhcp_gateway: Vec<String>,
-    /// 启用局域网模式时该网卡实际生效的默认网关（取自路由表，最可靠）
-    #[serde(default)]
-    runtime_gateway: Option<String>,
-    dns: String,
-}
-
-#[derive(serde::Serialize, serde::Deserialize, Default)]
-struct LanBackup {
-    adapters: Vec<AdapterBackup>,
-    persistent_routes: Vec<String>,
-}
-
-fn app_data_dir() -> std::path::PathBuf {
-    match std::env::var_os("APPDATA") {
-        Some(dir) => std::path::PathBuf::from(dir).join("NetCut"),
-        None => std::env::temp_dir().join("NetCut"),
-    }
-}
-
-fn lan_backup_path() -> std::path::PathBuf {
-    app_data_dir().join("lan-backup.json")
-}
 
 fn to_wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
@@ -559,6 +540,8 @@ struct AdapterAddrs {
     guid: String,
     /// 接口索引（路由表用）
     if_index: u32,
+    /// 接口 LUID（WFP 过滤用）
+    luid: u64,
     /// 连接名（"WLAN"、"以太网"）
     name: String,
     /// 设备描述（"Realtek PCIe GbE Family Controller"）
@@ -581,95 +564,6 @@ unsafe fn sockaddr_ipv4(
     Some(std::net::Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]))
 }
 
-fn if_index_of(guid: &str) -> Option<u32> {
-    adapter_addresses()
-        .into_iter()
-        .find(|a| a.guid.eq_ignore_ascii_case(guid))
-        .map(|a| a.if_index)
-}
-
-/// 从路由表读取指定网卡当前生效的默认网关。
-fn current_default_gateway(if_index: u32) -> Option<std::net::Ipv4Addr> {
-    use windows_sys::Win32::NetworkManagement::IpHelper as iphlp;
-
-    let mut size = 0u32;
-    unsafe {
-        iphlp::GetIpForwardTable(std::ptr::null_mut(), &mut size, 0);
-    }
-    if size == 0 {
-        return None;
-    }
-    let mut buf = vec![0u8; size as usize];
-    let table = buf.as_mut_ptr() as *mut iphlp::MIB_IPFORWARDTABLE;
-    let ret = unsafe { iphlp::GetIpForwardTable(table, &mut size, 0) };
-    if ret != 0 {
-        return None;
-    }
-    let count = unsafe { (*table).dwNumEntries } as usize;
-    let rows = unsafe { std::slice::from_raw_parts((*table).table.as_ptr(), count) };
-    for row in rows {
-        if row.dwForwardDest == 0 && row.dwForwardMask == 0 && row.dwForwardIfIndex == if_index {
-            if row.dwForwardNextHop == 0 {
-                continue;
-            }
-            let octets = row.dwForwardNextHop.to_ne_bytes();
-            return Some(std::net::Ipv4Addr::new(
-                octets[0], octets[1], octets[2], octets[3],
-            ));
-        }
-    }
-    None
-}
-
-/// 删除指定网卡的运行时默认路由（0.0.0.0/0），立即生效且无需重启网卡。
-fn delete_default_routes(if_index: u32) -> Result<(), String> {
-    use windows_sys::Win32::NetworkManagement::IpHelper as iphlp;
-
-    let mut size = 0u32;
-    unsafe {
-        iphlp::GetIpForwardTable(std::ptr::null_mut(), &mut size, 0);
-    }
-    if size == 0 {
-        return Ok(());
-    }
-    let mut buf = vec![0u8; size as usize];
-    let table = buf.as_mut_ptr() as *mut iphlp::MIB_IPFORWARDTABLE;
-    let ret = unsafe { iphlp::GetIpForwardTable(table, &mut size, 0) };
-    if ret != 0 {
-        return Err(format!("读取路由表失败（错误 {ret}）"));
-    }
-
-    let count = unsafe { (*table).dwNumEntries } as usize;
-    let rows = unsafe { std::slice::from_raw_parts((*table).table.as_ptr(), count) };
-    for row in rows {
-        if row.dwForwardDest == 0 && row.dwForwardMask == 0 && row.dwForwardIfIndex == if_index {
-            unsafe {
-                iphlp::DeleteIpForwardEntry(row);
-            }
-        }
-    }
-    Ok(())
-}
-
-/// 恢复指定网卡的默认路由（网关），立即生效。
-fn add_default_route(if_index: u32, gateway: std::net::Ipv4Addr) -> Result<(), String> {
-    use windows_sys::Win32::NetworkManagement::IpHelper as iphlp;
-
-    let mut row: iphlp::MIB_IPFORWARDROW = unsafe { std::mem::zeroed() };
-    row.dwForwardDest = 0;
-    row.dwForwardMask = 0;
-    row.dwForwardNextHop = u32::from_ne_bytes(gateway.octets());
-    row.dwForwardIfIndex = if_index;
-    row.Anonymous1.dwForwardType = iphlp::MIB_IPROUTE_TYPE_INDIRECT as u32;
-    row.Anonymous2.dwForwardProto = 3; // MIB_IPPROTO_NETMGMT
-    row.dwForwardMetric1 = 1;
-
-    let ret = unsafe { iphlp::CreateIpForwardEntry(&row) };
-    if ret != 0 {
-        return Err(format!("恢复默认路由失败（错误 {ret}）"));
-    }
-    Ok(())
-}
 
 /// 读取网卡的运行时信息（连接名/设备描述/当前 IP/前缀/DNS），
 /// DHCP 分配与自定义静态都能取到。
@@ -730,6 +624,7 @@ fn adapter_addresses() -> Vec<AdapterAddrs> {
         out.push(AdapterAddrs {
             guid,
             if_index: unsafe { a.Anonymous1.Anonymous.IfIndex },
+            luid: unsafe { a.Luid.Value },
             name: if a.FriendlyName.is_null() {
                 String::new()
             } else {
@@ -832,33 +727,6 @@ mod iface_reg {
         }
     }
 
-    pub fn read_dword(key: reg::HKEY, name: &str) -> Option<u32> {
-        unsafe {
-            let mut buf = vec![0u8; 8];
-            let (ty, len) = query(key, name, &mut buf)?;
-            if ty == reg::REG_DWORD && len == 4 {
-                Some(u32::from_ne_bytes(buf[..4].try_into().ok()?))
-            } else {
-                None
-            }
-        }
-    }
-
-    pub fn write_multi_sz(key: reg::HKEY, name: &str, values: &[String]) {
-        let mut data: Vec<u16> = values.iter().flat_map(|v| to_wide(v)).collect();
-        data.push(0);
-        unsafe {
-            reg::RegSetValueExW(
-                key,
-                to_wide(name).as_ptr(),
-                0,
-                reg::REG_MULTI_SZ,
-                data.as_ptr() as *const u8,
-                (data.len() * 2) as u32,
-            );
-        }
-    }
-
     pub fn write_string(key: reg::HKEY, name: &str, value: &str) {
         let data = to_wide(value);
         unsafe {
@@ -899,240 +767,8 @@ mod iface_reg {
     }
 }
 
-fn read_persistent_routes() -> Vec<String> {
-    use windows_sys::Win32::System::Registry as reg;
-    let mut key: reg::HKEY = std::ptr::null_mut();
-    let err = unsafe {
-        reg::RegOpenKeyExW(
-            reg::HKEY_LOCAL_MACHINE,
-            to_wide("SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters").as_ptr(),
-            0,
-            reg::KEY_READ | reg::KEY_WRITE,
-            &mut key,
-        )
-    };
-    if err != 0 {
-        return Vec::new();
-    }
-    let routes = iface_reg::read_multi_sz(key, "PersistentRoutes");
-    iface_reg::close(key);
-    routes
-}
-
-fn write_persistent_routes(routes: &[String]) {
-    use windows_sys::Win32::System::Registry as reg;
-    let mut key: reg::HKEY = std::ptr::null_mut();
-    let err = unsafe {
-        reg::RegOpenKeyExW(
-            reg::HKEY_LOCAL_MACHINE,
-            to_wide("SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters").as_ptr(),
-            0,
-            reg::KEY_READ | reg::KEY_WRITE,
-            &mut key,
-        )
-    };
-    if err != 0 {
-        return;
-    }
-    iface_reg::write_multi_sz(key, "PersistentRoutes", routes);
-    iface_reg::close(key);
-}
-
-fn load_backup() -> Option<LanBackup> {
-    let text = std::fs::read_to_string(lan_backup_path()).ok()?;
-    serde_json::from_str(&text).ok()
-}
-
-fn save_backup(backup: &LanBackup) -> Result<(), String> {
-    let _ = std::fs::create_dir_all(app_data_dir());
-    std::fs::write(
-        lan_backup_path(),
-        serde_json::to_string_pretty(backup).map_err(|e| e.to_string())?,
-    )
-    .map_err(|e| e.to_string())
-}
-
-/// 当前处于局域网模式的网卡 GUID 集合（由备份文件恢复，程序重启后仍能识别）。
-fn lan_mode_guids() -> std::collections::HashSet<String> {
-    load_backup()
-        .map(|b| b.adapters.into_iter().map(|a| a.guid).collect())
-        .unwrap_or_default()
-}
-
 /// 对单个网卡启用局域网模式：保留它当前的 IP（自定义静态或 DHCP 分配的都保留），
 /// 只把默认网关置空 —— 没有默认路由即无法访问外网，仅局域网可达。
-/// 首次启用时备份原配置，退出时精确恢复（DHCP 网卡恢复为 DHCP）。
-fn apply_lan_adapter(guid: &str, name: &str, devinst: u32) -> Result<(), String> {
-    let mut backup = load_backup().unwrap_or_else(|| LanBackup {
-        adapters: Vec::new(),
-        persistent_routes: read_persistent_routes(),
-    });
-
-    let key = iface_reg::open(guid)?;
-    let if_index = if_index_of(guid).unwrap_or(0);
-    // 已备份过则保留最初的原始配置，避免二次覆盖
-    if !backup.adapters.iter().any(|a| a.guid == guid) {
-        backup.adapters.push(AdapterBackup {
-            devinst,
-            if_index,
-            guid: guid.to_string(),
-            name: name.to_string(),
-            enable_dhcp: iface_reg::read_dword(key, "EnableDHCP").unwrap_or(1) == 1,
-            ip: iface_reg::read_multi_sz(key, "IPAddress"),
-            mask: iface_reg::read_multi_sz(key, "SubnetMask"),
-            gateway: iface_reg::read_multi_sz(key, "DefaultGateway"),
-            dhcp_gateway: iface_reg::read_multi_sz(key, "DhcpDefaultGateway"),
-            // 路由表里的网关最可靠（DHCP 网卡的注册表项常为空）
-            runtime_gateway: if if_index != 0 {
-                current_default_gateway(if_index).map(|g| g.to_string())
-            } else {
-                None
-            },
-            dns: iface_reg::read_string(key, "NameServer"),
-        });
-    }
-    let original = backup
-        .adapters
-        .iter()
-        .find(|a| a.guid == guid)
-        .cloned()
-        .unwrap_or_default();
-
-    // 保留当前生效的 IP/掩码/DNS（DHCP 租约或自定义静态），仅去掉网关
-    let current = adapter_addresses()
-        .into_iter()
-        .find(|a| a.guid.eq_ignore_ascii_case(guid));
-
-    let runtime = current.as_ref().and_then(|a| a.ip);
-    let (ip, mask) = match runtime {
-        Some((ip, prefix)) => (ip.to_string(), prefix_to_mask(prefix)),
-        None => match (original.ip.first(), original.mask.first()) {
-            (Some(ip), Some(mask)) => (ip.clone(), mask.clone()),
-            _ => {
-                iface_reg::close(key);
-                return Err(format!(
-                    "{name} 当前没有可用的 IPv4 地址，无法启用局域网模式"
-                ));
-            }
-        },
-    };
-    let dns = match current.as_ref() {
-        Some(a) if !a.dns.is_empty() => a
-            .dns
-            .iter()
-            .map(|d| d.to_string())
-            .collect::<Vec<_>>()
-            .join(","),
-        _ => original.dns.clone(),
-    };
-
-    iface_reg::write_dword(key, "EnableDHCP", 0);
-    iface_reg::write_multi_sz(key, "IPAddress", &[ip]);
-    iface_reg::write_multi_sz(key, "SubnetMask", &[mask]);
-    iface_reg::write_multi_sz(key, "DefaultGateway", &[]); // 清空网关 = 禁止外网
-    iface_reg::write_string(key, "NameServer", dns.trim());
-    iface_reg::close(key);
-
-    // 先落盘备份，再删掉运行时默认路由（立即生效，不重启网卡）
-    save_backup(&backup)?;
-    if if_index != 0 {
-        delete_default_routes(if_index)?;
-    }
-    Ok(())
-}
-
-/// 对单个网卡退出局域网模式：按备份恢复该网卡原配置。
-fn restore_lan_adapter(guid: &str) -> Result<(), String> {
-    let Some(mut backup) = load_backup() else {
-        return Ok(()); // 没有备份，无需恢复
-    };
-    let Some(index) = backup.adapters.iter().position(|a| a.guid == guid) else {
-        return Ok(());
-    };
-    let ab = backup.adapters.remove(index);
-
-    // 退出局域网模式 = 保留当前的静态 IP/掩码/DNS，只把默认网关写回去
-    let gateway = ab
-        .runtime_gateway
-        .as_deref()
-        .and_then(|g| g.trim().parse::<std::net::Ipv4Addr>().ok())
-        .or_else(|| {
-            ab.gateway
-                .first()
-                .and_then(|g| g.trim().parse::<std::net::Ipv4Addr>().ok())
-        })
-        .or_else(|| {
-            ab.dhcp_gateway
-                .first()
-                .and_then(|g| g.trim().parse::<std::net::Ipv4Addr>().ok())
-        });
-
-    let key = iface_reg::open(&ab.guid)?;
-    match gateway {
-        Some(gateway) => {
-            // 保留静态 IP/掩码/DNS，只补回默认网关
-            iface_reg::write_multi_sz(key, "DefaultGateway", &[gateway.to_string()]);
-        }
-        None if ab.enable_dhcp => {
-            // 启用时没能记录到任何网关：退回自动获取，避免留下"静态但无网关"的断网状态
-            iface_reg::write_dword(key, "EnableDHCP", 1);
-            iface_reg::delete(key, "IPAddress");
-            iface_reg::delete(key, "SubnetMask");
-            iface_reg::delete(key, "DefaultGateway");
-            iface_reg::delete(key, "NameServer");
-        }
-        None => {}
-    }
-    iface_reg::close(key);
-
-    if backup.adapters.is_empty() {
-        // 最后一个网卡已恢复，还原最初的静态路由表并清理备份
-        write_persistent_routes(&backup.persistent_routes);
-        let _ = std::fs::remove_file(lan_backup_path());
-    } else {
-        save_backup(&backup)?;
-    }
-
-    // 让 Windows 自己重新应用配置（重启网卡）：这样"网络连接"里的网关、
-    // DNS、路由度量都会按配置正确刷新——手工补路由的话系统状态页不认。
-    let restarted = match restart_device(ab.devinst) {
-        Ok(()) => true,
-        Err(err) => {
-            log_operation(
-                "恢复配置:重启网卡失败",
-                &Err(err),
-                std::time::Duration::from_secs(0),
-            );
-            false
-        }
-    };
-
-    let if_index = if ab.if_index != 0 {
-        ab.if_index
-    } else {
-        if_index_of(&ab.guid).unwrap_or(0)
-    };
-
-    if restarted && if_index != 0 && gateway.is_some() {
-        // 等待系统按配置重新拿到地址与网关（拿到即返回）
-        for _ in 0..12 {
-            std::thread::sleep(std::time::Duration::from_millis(1000));
-            if current_default_gateway(if_index).is_some() {
-                break;
-            }
-        }
-    }
-
-    // 兜底：重启失败或系统仍未恢复网关时，手工补一条默认路由保证能上网
-    if if_index != 0
-        && let Some(gateway) = gateway
-        && current_default_gateway(if_index).is_none()
-    {
-        add_default_route(if_index, gateway)?;
-    }
-    Ok(())
-}
-
 /// 重启网卡（禁用→启用），让 Windows 重新应用注册表里的网络配置。
 /// 每步都有超时保护，避免个别设备卡死。
 fn restart_device(devinst: u32) -> Result<(), String> {
@@ -1228,68 +864,391 @@ fn spawn_dhcp_thread(tx: UnboundedSender<Msg>, guid: String, devinst: u32) {
     );
 }
 
-fn spawn_lan_thread(tx: UnboundedSender<Msg>, enable: bool) {
-    run_operation(
-        tx,
-        if enable { "启用局域网模式" } else { "退出局域网模式" },
-        move || {
-            if enable {
-                apply_lan_all()
-            } else {
-                restore_lan_all()
-            }
-            .and_then(|_| query_status())
-        },
-        move |result| Msg::LanResult(result, enable),
-    );
-}
+// ---------------------------------------------------------------------------
+// 局域网模式：WFP 接口过滤（保留网关/IP 配置，只拦截非局域网流量）
+// ---------------------------------------------------------------------------
 
-/// 启用局域网模式：对所有网卡清空默认网关（保留各自 IP）。
-fn apply_lan_all() -> Result<(), String> {
+/// 组装过滤所需信息：每张网卡的接口 LUID + 当前 IPv4 地址与前缀长度
+fn lan_filter_interfaces() -> Result<Vec<(u64, Option<(u32, u8)>)>, String> {
     let (_, adapters) = query_status()?;
-    let mut ok = 0usize;
-    let mut failed = Vec::new();
-    for adapter in &adapters {
-        match apply_lan_adapter(&adapter.guid, &adapter.name, adapter.devinst) {
-            Ok(()) => ok += 1,
-            Err(err) => failed.push(err),
-        }
-    }
-    if ok == 0 {
-        Err(if failed.is_empty() {
-            "没有可应用的网卡".to_string()
-        } else {
-            format!("局域网模式启用失败: {}", failed.join("; "))
+    let interfaces: Vec<(u64, Option<(u32, u8)>)> = adapters
+        .iter()
+        .filter(|a| a.luid != 0)
+        .map(|a| {
+            let ipv4 = a
+                .ip
+                .parse::<std::net::Ipv4Addr>()
+                .ok()
+                .map(|ip| (u32::from_be_bytes(ip.octets()), prefix_len(&a.mask)));
+            (a.luid, ipv4)
         })
+        .collect();
+    if interfaces.is_empty() {
+        Err("没有可应用局域网模式的网卡".to_string())
     } else {
-        Ok(())
+        Ok(interfaces)
     }
 }
 
-/// 退出局域网模式：按备份恢复所有被改动的网卡。
-fn restore_lan_all() -> Result<(), String> {
-    let mut ok = 0usize;
-    let mut failed = Vec::new();
-    // 每恢复一个网卡，该网卡即从备份中移除
-    loop {
-        let Some(backup) = load_backup() else { break };
-        let Some(adapter) = backup.adapters.first() else {
-            break;
-        };
-        let guid = adapter.guid.clone();
-        match restore_lan_adapter(&guid) {
-            Ok(()) => ok += 1,
-            Err(err) => {
-                failed.push(err);
-                break;
+/// 点分掩码 → 前缀长度
+fn prefix_len(mask: &str) -> u8 {
+    mask.parse::<std::net::Ipv4Addr>()
+        .map(|m| u32::from_be_bytes(m.octets()).count_ones() as u8)
+        .unwrap_or(0)
+}
+
+/// 启用局域网模式：挂 WFP 过滤器 + 启动 DNS 转发器（用于域名白名单）
+fn enable_lan_mode(app: &mut App) -> Result<(), String> {
+    let interfaces = lan_filter_interfaces()?;
+    let adapters = app.global::<NetCut>().adapters.clone();
+    let whitelist = whitelist::Whitelist::parse(&whitelist_text());
+
+    // 1) 先记录并重定向 DNS（白名单需要看到查询的域名）
+    let backup = dns_backup(&adapters);
+    let upstream = upstream_dns(&adapters, &backup);
+    let mut proxy = None;
+    if !whitelist.is_empty() {
+        let tx = app.global::<NetCut>().tx.clone();
+        proxy = Some(dnsproxy::DnsProxy::start(
+            upstream.clone(),
+            whitelist.clone(),
+            move |resolved, ack| {
+                let _ = tx.unbounded_send(Msg::WhitelistResolved(
+                    resolved.addresses,
+                    resolved.ttl,
+                    Some(ack),
+                ));
+            },
+        )?);
+        for (guid, _) in &backup {
+            write_iface_dns(guid, Some("127.0.0.1"))?;
+        }
+        // 让系统立即按新 DNS 重新配置（刷新解析缓存 + 触发一次续约）
+        flush_dns_cache();
+        for (guid, _) in &backup {
+            if let Some(if_index) = if_index_of(guid) {
+                renew_interface(if_index);
+            }
+        }
+        save_dns_backup(&backup);
+    }
+
+    // 2) 挂 WFP 过滤器
+    let session = match wfp::enable(&interfaces) {
+        Ok(session) => session,
+        Err(err) => {
+            // 回滚 DNS 改动
+            if proxy.is_some() {
+                restore_dns(&backup);
+            }
+            return Err(err);
+        }
+    };
+
+    let warnings = session.warnings().to_vec();
+    {
+        let g = app.global_mut::<NetCut>();
+        g.lan_filter = Some(session);
+        g.lan_adapters = adapters.iter().map(|a| a.guid.clone()).collect();
+        g.dns_proxy = proxy;
+        g.dns_upstream = upstream;
+        g.whitelist_permits.clear();
+        g.error = warnings
+            .first()
+            .map(|w| format!("部分规则未生效（详见 %TEMP%\\netcut-ops.log）：{w}"));
+    }
+    log_operation(
+        "启用局域网模式",
+        &Ok((
+            app.global::<NetCut>().status,
+            app.global::<NetCut>().adapters.clone(),
+        )),
+        std::time::Duration::from_secs(0),
+    );
+    for warning in &warnings {
+        log_operation(
+            "局域网模式警告",
+            &Err(warning.clone()),
+            std::time::Duration::from_secs(0),
+        );
+    }
+    // 立即主动解析白名单里的具体域名（不依赖 DNS 转发，DoH/缓存场景也能放行）
+    refresh_whitelist_permits(app, true);
+    Ok(())
+}
+
+/// 主动解析白名单里的具体域名并直接放行其 IP。
+/// 不依赖 DNS 转发：浏览器 DoH、系统缓存、直接填 IP 访问都能生效。
+fn spawn_whitelist_resolve(tx: UnboundedSender<Msg>, names: Vec<String>, ttl: u32) {
+    if names.is_empty() {
+        return;
+    }
+    std::thread::spawn(move || {
+        let mut addresses: Vec<std::net::IpAddr> = Vec::new();
+        for name in names {
+            // 用系统解析器（此时 DNS 已指向本机转发器或原 DNS）
+            if let Ok(resolved) = (name.as_str(), 0u16).to_socket_addrs() {
+                for addr in resolved {
+                    let ip = addr.ip();
+                    if !addresses.contains(&ip) {
+                        addresses.push(ip);
+                    }
+                }
+            }
+        }
+        if !addresses.is_empty() {
+            let _ = tx.unbounded_send(Msg::WhitelistResolved(addresses, ttl, None));
+        }
+    });
+}
+
+/// 上次主动解析白名单的时间（避免 5 秒刷新时反复解析）
+static LAST_PROACTIVE: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// 定时（或开关时）触发白名单域名的主动解析
+fn refresh_whitelist_permits(app: &mut App, force: bool) {
+    if app.global::<NetCut>().lan_filter.is_none() {
+        return;
+    }
+    let names = whitelist::Whitelist::parse(&whitelist_text()).resolvable_names();
+    if names.is_empty() {
+        return;
+    }
+    {
+        let mut last = LAST_PROACTIVE.lock().unwrap();
+        if !force
+            && last
+                .map(|t| t.elapsed() < std::time::Duration::from_secs(60))
+                .unwrap_or(false)
+        {
+            return;
+        }
+        *last = Some(std::time::Instant::now());
+    }
+    // 主动解析出来的放行给较长的有效期（域名 IP 可能变化，60 秒后重新解析并续期）
+    spawn_whitelist_resolve(app.global::<NetCut>().tx.clone(), names, 300);
+}
+
+/// 关闭局域网模式：撤销过滤器、停止转发器、还原 DNS
+fn disable_lan_mode(app: &mut App) {
+    {
+        let g = app.global_mut::<NetCut>();
+        g.lan_filter = None; // 丢弃会话即撤销全部过滤规则
+        g.dns_proxy = None; // 停止 DNS 转发器
+        g.whitelist_permits.clear();
+        g.lan_adapters.clear();
+        g.error = None;
+    }
+    restore_leftover_dns();
+}
+
+/// 保存白名单后重建 DNS 转发器，使新规则立即生效
+fn restart_dns_proxy(app: &mut App, window: &mut Window) {
+    let (upstream, tx) = {
+        let g = app.global::<NetCut>();
+        (g.dns_upstream.clone(), g.tx.clone())
+    };
+    let whitelist = whitelist::Whitelist::parse(&whitelist_text());
+
+    let g = app.global_mut::<NetCut>();
+    g.dns_proxy = None; // 先停掉旧的
+    // 撤销旧的动态放行，避免残留
+    if let Some(session) = g.lan_filter.as_mut() {
+        for (_, (id, _)) in g.whitelist_permits.drain() {
+            session.revoke(id);
+        }
+    } else {
+        g.whitelist_permits.clear();
+    }
+
+    if whitelist.is_empty() || upstream.is_empty() {
+        window.refresh();
+        return;
+    }
+    match dnsproxy::DnsProxy::start(upstream, whitelist, move |resolved, ack| {
+        let _ = tx.unbounded_send(Msg::WhitelistResolved(
+            resolved.addresses,
+            resolved.ttl,
+            Some(ack),
+        ));
+    }) {
+        Ok(proxy) => g.dns_proxy = Some(proxy),
+        Err(err) => g.error = Some(err),
+    }
+    window.refresh();
+}
+
+// dnsapi.dll 的解析缓存刷新（windows-sys 未导出该函数，直接声明）
+#[link(name = "dnsapi")]
+unsafe extern "system" {
+    fn DnsFlushResolverCache() -> i32;
+}
+
+/// 刷新 DNS 解析缓存（改完网卡 DNS 后让系统立即生效）
+fn flush_dns_cache() {
+    unsafe {
+        DnsFlushResolverCache();
+    }
+}
+
+/// 触发一次接口续约，让系统重新读取接口配置（DNS 改动随即生效）
+fn renew_interface(if_index: u32) {
+    use windows_sys::Win32::NetworkManagement::IpHelper as iphlp;
+    let mut map: iphlp::IP_ADAPTER_INDEX_MAP = unsafe { std::mem::zeroed() };
+    map.Index = if_index;
+    unsafe {
+        iphlp::IpRenewAddress(&map);
+    }
+}
+
+/// 清理 TTL 过期的白名单放行规则
+fn expire_whitelist_permits(app: &mut App) {
+    let now = std::time::Instant::now();
+    let g = app.global_mut::<NetCut>();
+    let expired: Vec<std::net::IpAddr> = g
+        .whitelist_permits
+        .iter()
+        .filter(|(_, (_, expires))| *expires <= now)
+        .map(|(ip, _)| *ip)
+        .collect();
+    if expired.is_empty() {
+        return;
+    }
+    if let Some(session) = g.lan_filter.as_mut() {
+        for ip in expired {
+            if let Some((id, _)) = g.whitelist_permits.remove(&ip) {
+                session.revoke(id);
             }
         }
     }
-    if ok == 0 && !failed.is_empty() {
-        Err(format!("恢复失败: {}", failed.join("; ")))
-    } else {
-        Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// DNS 重定向：把网卡 DNS 临时指向本机转发器，退出/异常后可恢复
+// ---------------------------------------------------------------------------
+
+fn netcut_data_dir() -> std::path::PathBuf {
+    match std::env::var_os("APPDATA") {
+        Some(dir) => std::path::PathBuf::from(dir).join("NetCut"),
+        None => std::env::temp_dir().join("NetCut"),
     }
+}
+
+fn whitelist_path() -> std::path::PathBuf {
+    netcut_data_dir().join("lan-whitelist.txt")
+}
+
+fn dns_backup_path() -> std::path::PathBuf {
+    netcut_data_dir().join("dns-backup.json")
+}
+
+fn whitelist_text() -> String {
+    std::fs::read_to_string(whitelist_path()).unwrap_or_default()
+}
+
+fn save_whitelist_text(text: &str) {
+    let _ = std::fs::create_dir_all(netcut_data_dir());
+    let _ = std::fs::write(whitelist_path(), text);
+}
+
+fn read_iface_dns(guid: &str) -> Option<String> {
+    let key = iface_reg::open(guid).ok()?;
+    let value = iface_reg::read_string(key, "NameServer");
+    iface_reg::close(key);
+    (!value.trim().is_empty()).then_some(value.trim().to_string())
+}
+
+fn write_iface_dns(guid: &str, value: Option<&str>) -> Result<(), String> {
+    let key = iface_reg::open(guid)?;
+    match value {
+        Some(value) => iface_reg::write_string(key, "NameServer", value),
+        // 空值：删除该项，让 DHCP 下发的 DNS 重新生效
+        None => iface_reg::delete(key, "NameServer"),
+    }
+    iface_reg::close(key);
+    Ok(())
+}
+
+/// 记录当前各网卡的 DNS 配置（用于恢复）
+fn dns_backup(adapters: &[AdapterInfo]) -> Vec<(String, Option<String>)> {
+    adapters
+        .iter()
+        .filter(|a| a.luid != 0 && !a.guid.is_empty())
+        .map(|a| (a.guid.clone(), read_iface_dns(&a.guid)))
+        .collect()
+}
+
+fn save_dns_backup(backup: &[(String, Option<String>)]) {
+    if let Ok(json) = serde_json::to_string_pretty(backup) {
+        let _ = std::fs::create_dir_all(netcut_data_dir());
+        let _ = std::fs::write(dns_backup_path(), json);
+    }
+}
+
+/// 恢复 DNS 配置并清理恢复标记
+fn restore_dns(backup: &[(String, Option<String>)]) {
+    for (guid, value) in backup {
+        let _ = write_iface_dns(guid, value.as_deref());
+    }
+    let _ = std::fs::remove_file(dns_backup_path());
+}
+
+/// 启动时检查上次运行是否残留了 DNS 改动（异常退出），有则恢复
+fn restore_leftover_dns() {
+    let Ok(text) = std::fs::read_to_string(dns_backup_path()) else {
+        return;
+    };
+    if let Ok(backup) = serde_json::from_str::<Vec<(String, Option<String>)>>(&text) {
+        restore_dns(&backup);
+        log_operation(
+            "恢复上次残留的 DNS 配置",
+            &Err(format!("已还原 {} 个网卡", backup.len())),
+            std::time::Duration::from_secs(0),
+        );
+    } else {
+        let _ = std::fs::remove_file(dns_backup_path());
+    }
+}
+
+/// 选择上游 DNS：优先使用各网卡原本的 DNS，其次网关，最后回退到公共 DNS
+fn upstream_dns(adapters: &[AdapterInfo], backup: &[(String, Option<String>)]) -> Vec<std::net::IpAddr> {
+    fn push(servers: &mut Vec<std::net::IpAddr>, raw: &str) {
+        for part in raw.split([',', ' ', ';']) {
+            let part = part.trim();
+            if let Ok(ip) = part.parse::<std::net::IpAddr>()
+                && !servers.contains(&ip)
+            {
+                servers.push(ip);
+            }
+        }
+    }
+
+    let mut servers: Vec<std::net::IpAddr> = Vec::new();
+    for (_, value) in backup {
+        if let Some(value) = value {
+            push(&mut servers, value);
+        }
+    }
+    if servers.is_empty() {
+        for adapter in adapters {
+            if !adapter.gateway.is_empty() {
+                push(&mut servers, &adapter.gateway);
+            }
+        }
+    }
+    if servers.is_empty() {
+        push(&mut servers, "1.1.1.1");
+        push(&mut servers, "8.8.8.8");
+    }
+    servers
+}
+
+/// 接口 GUID → 接口索引
+fn if_index_of(guid: &str) -> Option<u32> {
+    adapter_addresses()
+        .into_iter()
+        .find(|a| a.guid.eq_ignore_ascii_case(guid))
+        .map(|a| a.if_index)
 }
 
 // ---------------------------------------------------------------------------
@@ -1515,6 +1474,10 @@ fn handle_msg(app: &mut App, msg: Msg) {
                 // 定时刷新失败不打扰用户（保留原有内容与错误提示）
                 Err(_) => return,
             }
+            // 顺手清理已过期的白名单放行规则（TTL 到期）
+            expire_whitelist_permits(app);
+            // 定期重新解析白名单域名（域名 IP 变化时自动跟进）
+            refresh_whitelist_permits(app, false);
             refresh_tray(app);
             app.refresh_windows();
         }
@@ -1532,17 +1495,52 @@ fn handle_msg(app: &mut App, msg: Msg) {
             spawn_dhcp_thread(tx, guid, devinst);
         }
         Msg::LanApply { enable } => {
+            if enable {
+                match enable_lan_mode(app) {
+                    Ok(()) => {}
+                    Err(err) => {
+                        let g = app.global_mut::<NetCut>();
+                        g.lan_filter = None;
+                        g.lan_adapters.clear();
+                        g.dns_proxy = None;
+                        g.error = Some(err);
+                    }
+                }
+            } else {
+                disable_lan_mode(app);
+            }
+            refresh_tray(app);
+            app.refresh_windows();
+        }
+        Msg::WhitelistResolved(addresses, ttl, ack) => {
+            // 命中白名单：为解析到的 IP 加放行规则，并记录过期时间
+            let now = std::time::Instant::now();
+            let expires = now + std::time::Duration::from_secs(ttl.max(30) as u64);
             {
                 let g = app.global_mut::<NetCut>();
-                if g.busy {
-                    return;
+                for ip in addresses {
+                    // 已有放行规则：仅续期，不重复添加
+                    if let Some((id, _)) = g.whitelist_permits.get(&ip).copied() {
+                        g.whitelist_permits.insert(ip, (id, expires));
+                        continue;
+                    }
+                    if let Some(session) = g.lan_filter.as_mut() {
+                        match session.permit_ip(ip, "whitelist") {
+                            Ok(id) => {
+                                g.whitelist_permits.insert(ip, (id, expires));
+                            }
+                            Err(err) => {
+                                g.error = Some(err);
+                                break;
+                            }
+                        }
+                    }
                 }
-                g.busy = true;
-                g.error = None;
             }
-            app.refresh_windows();
-            let tx = app.global::<NetCut>().tx.clone();
-            spawn_lan_thread(tx, enable);
+            // 通知转发器：放行规则已就绪，可以把解析结果回给客户端了
+            if let Some(ack) = ack {
+                let _ = ack.send(());
+            }
         }
         Msg::NetResult(result) => {
             {
@@ -1552,28 +1550,6 @@ fn handle_msg(app: &mut App, msg: Msg) {
                     Ok((status, adapters)) => {
                         g.status = status;
                         g.adapters = adapters;
-                        ensure_selection(g);
-                        g.error = None;
-                    }
-                    Err(err) => g.error = Some(err),
-                }
-            }
-            refresh_tray(app);
-            app.refresh_windows();
-        }
-        Msg::LanResult(result, enable) => {
-            {
-                let g = app.global_mut::<NetCut>();
-                g.busy = false;
-                match result {
-                    Ok((status, adapters)) => {
-                        g.status = status;
-                        g.adapters = adapters;
-                        // 以备份文件为准，反映所有已生效的网卡
-                        g.lan_adapters = lan_mode_guids();
-                        if !enable {
-                            g.lan_adapters.clear();
-                        }
                         ensure_selection(g);
                         g.error = None;
                     }
@@ -1633,6 +1609,7 @@ fn ensure_selection(g: &mut NetCut) {
 struct Dashboard {
     combo: Entity<ComboboxState<AdapterDelegate>>,
     signature: String,
+    whitelist: Entity<TextareaState>,
 }
 
 /// 下拉框中的一个网卡条目
@@ -1732,9 +1709,19 @@ impl Dashboard {
             .unwrap_or_default();
         let delegate = build_adapter_delegate(&adapters);
         let combo = cx.new(|cx| ComboboxState::new(delegate, Vec::new(), window, cx));
+        let text = whitelist_text();
+        let whitelist = cx.new(|cx| {
+            let mut state = TextareaState::new(window, cx)
+                .placeholder("example.com（自身+所有子域）\n*.corp.cn（后缀匹配）\napi.*（前缀匹配）");
+            if !text.trim().is_empty() {
+                state.set_value(text, window, cx);
+            }
+            state
+        });
         Self {
             combo,
             signature: adapter_signature(&adapters),
+            whitelist,
         }
     }
 }
@@ -2015,7 +2002,7 @@ impl Render for Dashboard {
                                         .text_xs()
                                         .text_color(lan_badge_color)
                                         .child(if in_lan_mode {
-                                            "局域网模式：已启用（网关已清空）"
+                                            "局域网模式：已启用（已拦截非局域网流量）"
                                         } else {
                                             "局域网模式：未启用"
                                         }),
@@ -2038,6 +2025,51 @@ impl Render for Dashboard {
                 );
             }
         }
+
+        // 域名白名单：局域网模式下按白名单放行（DNS 转发器解析出的 IP 自动放行）
+        root = root.child(
+            div()
+                .w_full()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .child("域名白名单（每行一条：example.com / *.corp.cn 后缀匹配，api.* 前缀匹配）"),
+                )
+                .child(div().h(px(64.0)).child(Textarea::new(&self.whitelist)))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .child(
+                            Button::new("whitelist-save")
+                                .label("保存白名单")
+                                .small()
+                                .on_click(cx.listener(|this: &mut Dashboard, _, window, cx| {
+                                    let text = this.whitelist.read(cx).value().to_string();
+                                    save_whitelist_text(&text);
+                                    // 局域网模式已开启时立即重建 DNS 转发器使白名单生效
+                                    if cx.global::<NetCut>().lan_filter.is_some() {
+                                        restart_dns_proxy(cx, window);
+                                    }
+                                })),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(cx.theme().muted_foreground)
+                                .child(if lan_any_active {
+                                    format!("已生效（当前 {} 条）", whitelist::Whitelist::parse(&whitelist_text()).len())
+                                } else {
+                                    format!("保存后在开启局域网模式时生效（当前 {} 条）", whitelist::Whitelist::parse(&whitelist_text()).len())
+                                }),
+                        ),
+                ),
+        );
 
         // 第四部分：操作按钮（底部对齐）
         let lan_all_active = lan_total > 0 && lan_active == lan_total;
@@ -2082,7 +2114,9 @@ impl Render for Dashboard {
                     } else {
                         lan_button
                     };
-                    lan_button.on_click(cx.listener(move |_, _, _, cx| {
+                    lan_button.on_click(cx.listener(move |this: &mut Dashboard, _, _, cx| {
+                        // 先把输入框里的白名单落盘，保证"输入即可生效"（无需先点保存）
+                        save_whitelist_text(&this.whitelist.read(cx).value().to_string());
                         let tx = cx.global::<NetCut>().tx.clone();
                         let _ = tx.unbounded_send(Msg::LanApply {
                             enable: lan_click_enables,
@@ -2168,6 +2202,9 @@ fn main() {
 
     ensure_admin();
 
+    // 上次运行若异常退出，可能残留 DNS 改动：启动时先恢复
+    restore_leftover_dns();
+
     application().with_assets(assets::Assets).run(|cx| {
         gpui_kit::init(cx);
         Theme::change(ThemeMode::Dark, None, cx);
@@ -2185,7 +2222,12 @@ fn main() {
             tray_tooltip: String::new(),
             status: NetStatus::Unknown,
             busy: true,
-            lan_adapters: lan_mode_guids(),
+            // WFP 过滤是进程级临时规则：程序启动时必然处于关闭状态
+            lan_adapters: std::collections::HashSet::new(),
+            lan_filter: None,
+            dns_proxy: None,
+            dns_upstream: Vec::new(),
+            whitelist_permits: std::collections::HashMap::new(),
             selected: None,
             adapters: Vec::new(),
             error: None,
